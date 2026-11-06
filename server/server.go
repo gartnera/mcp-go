@@ -263,6 +263,7 @@ type MCPServer struct {
 	expiredTasks                 map[string]time.Time // Tracks recently expired task IDs with expiration timestamp
 	maxConcurrentTasks           *int                 // Optional limit on concurrent running tasks
 	defaultTaskTTLMs             *int64               // Fallback TTL applied when client supplies none
+	taskDecision                 TaskDecisionFunc     // Per-request task choice for TaskSupportOptional tools (see WithTaskDecision)
 	activeTasks                  int                  // Current count of running (non-terminal) tasks
 	inflightCancels              sync.Map             // Maps request ID -> context.CancelFunc for in-flight requests
 	inputValidator               *inputSchemaValidator
@@ -629,6 +630,23 @@ func WithTaskHooks(taskHooks *TaskHooks) ServerOption {
 func WithMaxConcurrentTasks(limit int) ServerOption {
 	return func(s *MCPServer) {
 		s.maxConcurrentTasks = &limit
+	}
+}
+
+// TaskDecisionFunc reports whether a tools/call request should run as a task.
+type TaskDecisionFunc func(ctx context.Context, request mcp.CallToolRequest) bool
+
+// WithTaskDecision sets how the server decides, per request, whether a call
+// to a TaskSupportOptional tool runs as a task when the client declared the
+// tasks extension. Under the extension the server is the one that decides
+// (SEP-2663), so without this option every such call becomes a task; with
+// it, a call for which decide returns false runs synchronously and returns
+// its result directly. TaskSupportRequired tools, task-only tools
+// (AddTaskTool), and legacy task-augmented requests (params.task) are not
+// affected.
+func WithTaskDecision(decide TaskDecisionFunc) ServerOption {
+	return func(s *MCPServer) {
+		s.taskDecision = decide
 	}
 }
 
@@ -2321,6 +2339,14 @@ func (s *MCPServer) handleToolCall(
 			tool.Tool.Execution != nil &&
 			(tool.Tool.Execution.TaskSupport == mcp.TaskSupportOptional ||
 				tool.Tool.Execution.TaskSupport == mcp.TaskSupportRequired)
+		// Under the extension the server decides per request: a
+		// TaskSupportOptional tool runs synchronously when the server's
+		// task decision declines this call.
+		if shouldExecuteAsTask && s.taskDecision != nil &&
+			tool.Tool.Execution.TaskSupport == mcp.TaskSupportOptional &&
+			!s.taskDecision(ctx, request) {
+			shouldExecuteAsTask = false
+		}
 	} else {
 		shouldExecuteAsTask = request.Params.Task != nil &&
 			tool.Tool.Execution != nil &&
