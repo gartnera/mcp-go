@@ -341,7 +341,7 @@ func TestTaskHooks_IntegrationWithTaskTool(t *testing.T) {
 		},
 	}
 
-	result, reqErr := server.handleTaskAugmentedToolCall(ctx, "test-id", request)
+	result, reqErr := server.handleTaskAugmentedToolCall(ctx, "test-id", request, nil)
 	require.Nil(t, reqErr)
 	require.NotNil(t, result)
 

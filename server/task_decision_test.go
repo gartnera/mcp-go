@@ -75,3 +75,80 @@ func TestWithTaskDecision_RequiredUnaffected(t *testing.T) {
 	_, ok := resp.Result.(*mcp.CreateTaskResult)
 	assert.True(t, ok, "Expected *CreateTaskResult, got %T", resp.Result)
 }
+
+type taskStartKey struct{}
+
+// TestWithTaskStart verifies that the server's task start chooses the path,
+// hands the handler its context either way, and sets the working task's
+// status message and the create-task result's _meta.
+func TestWithTaskStart(t *testing.T) {
+	srv := NewMCPServer("test", "1.0.0",
+		WithTaskCapabilities(true, true, true),
+		WithTasksExtension(),
+		WithTaskStart(func(ctx context.Context, req mcp.CallToolRequest) TaskStart {
+			async := req.GetBool("async", false)
+			start := TaskStart{
+				AsTask:  async,
+				Context: context.WithValue(ctx, taskStartKey{}, "prepared"),
+			}
+			if async {
+				start.StatusMessage = "working on it"
+				start.Meta = &mcp.Meta{AdditionalFields: map[string]any{"note": "started"}}
+			}
+			return start
+		}),
+	)
+	release := make(chan struct{})
+	srv.AddTool(mcp.NewTool("work", mcp.WithTaskSupport(mcp.TaskSupportOptional)),
+		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			prepared, _ := ctx.Value(taskStartKey{}).(string)
+			if req.GetBool("async", false) {
+				<-release
+			}
+			return mcp.NewToolResultText(prepared), nil
+		})
+
+	t.Run("declined runs synchronously with the start's context", func(t *testing.T) {
+		resp := callModern(t, srv, "work", map[string]any{"async": false})
+		result, ok := resp.Result.(*mcp.CallToolResult)
+		require.True(t, ok, "Expected *CallToolResult, got %T", resp.Result)
+		require.Len(t, result.Content, 1)
+		assert.Equal(t, "prepared", result.Content[0].(mcp.TextContent).Text)
+	})
+
+	t.Run("accepted starts a task with its status message and _meta", func(t *testing.T) {
+		resp := callModern(t, srv, "work", map[string]any{"async": true})
+		result, ok := resp.Result.(*mcp.CreateTaskResult)
+		require.True(t, ok, "Expected *CreateTaskResult, got %T", resp.Result)
+		assert.Equal(t, "working on it", result.Task.StatusMessage)
+		require.NotNil(t, result.Meta)
+		assert.Equal(t, "started", result.Meta.AdditionalFields["note"])
+
+		encoded, err := json.Marshal(result)
+		require.NoError(t, err)
+		var wire map[string]any
+		require.NoError(t, json.Unmarshal(encoded, &wire))
+		assert.Equal(t, "working on it", wire["statusMessage"])
+		meta, ok := wire["_meta"].(map[string]any)
+		require.True(t, ok, "Expected a _meta object, got %T", wire["_meta"])
+		assert.Equal(t, "started", meta["note"])
+
+		task, _, err := srv.getTask(t.Context(), result.Task.TaskId)
+		require.NoError(t, err)
+		assert.Equal(t, "working on it", task.StatusMessage)
+
+		close(release)
+		entry, err := srv.getTaskEntry(t.Context(), result.Task.TaskId)
+		require.NoError(t, err)
+		<-entry.done
+		srv.tasksMu.RLock()
+		finished := entry.task
+		stored := entry.result
+		srv.tasksMu.RUnlock()
+		assert.Equal(t, mcp.TaskStatusCompleted, finished.Status)
+		assert.Empty(t, finished.StatusMessage, "the working status message outlived the task")
+		callResult, ok := stored.(*mcp.CallToolResult)
+		require.True(t, ok, "Expected *CallToolResult, got %T", stored)
+		assert.Equal(t, "prepared", callResult.Content[0].(mcp.TextContent).Text)
+	})
+}

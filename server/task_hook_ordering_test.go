@@ -27,7 +27,7 @@ func startSlowTask(t *testing.T, server *MCPServer) <-chan struct{} {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		_, _ = server.handleTaskAugmentedToolCall(t.Context(), "slow", mcp.CallToolRequest{Params: mcp.CallToolParams{Name: "slow", Task: &mcp.TaskParams{}}})
+		_, _ = server.handleTaskAugmentedToolCall(t.Context(), "slow", mcp.CallToolRequest{Params: mcp.CallToolParams{Name: "slow", Task: &mcp.TaskParams{}}}, nil)
 	}()
 	return done
 }

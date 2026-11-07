@@ -249,7 +249,7 @@ func TestMaxConcurrentTasks(t *testing.T) {
 				Task: &mcp.TaskParams{},
 			},
 		}
-		result1, reqErr := server.handleTaskAugmentedToolCall(ctx, "test-id-1", request1)
+		result1, reqErr := server.handleTaskAugmentedToolCall(ctx, "test-id-1", request1, nil)
 		require.Nil(t, reqErr)
 		require.NotNil(t, result1)
 
@@ -260,7 +260,7 @@ func TestMaxConcurrentTasks(t *testing.T) {
 				Task: &mcp.TaskParams{},
 			},
 		}
-		result2, reqErr := server.handleTaskAugmentedToolCall(ctx, "test-id-2", request2)
+		result2, reqErr := server.handleTaskAugmentedToolCall(ctx, "test-id-2", request2, nil)
 		require.NotNil(t, reqErr)
 		require.Nil(t, result2)
 		assert.Equal(t, mcp.INTERNAL_ERROR, reqErr.code)

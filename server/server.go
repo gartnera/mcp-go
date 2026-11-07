@@ -59,6 +59,9 @@ type taskEntry struct {
 	// that cancels its own task does not wait for itself.
 	createdHookDone bool
 	pendingHooks    []func()
+	// workingStatusMessage is the status message the server's task start
+	// (WithTaskStart) gave the working task; completion clears it.
+	workingStatusMessage string
 }
 
 // ServerOption is a function that configures an MCPServer.
@@ -263,7 +266,7 @@ type MCPServer struct {
 	expiredTasks                 map[string]time.Time // Tracks recently expired task IDs with expiration timestamp
 	maxConcurrentTasks           *int                 // Optional limit on concurrent running tasks
 	defaultTaskTTLMs             *int64               // Fallback TTL applied when client supplies none
-	taskDecision                 TaskDecisionFunc     // Per-request task choice for TaskSupportOptional tools (see WithTaskDecision)
+	taskStart                    TaskStartFunc        // Per-request task choice for TaskSupportOptional tools (see WithTaskStart, WithTaskDecision)
 	activeTasks                  int                  // Current count of running (non-terminal) tasks
 	inflightCancels              sync.Map             // Maps request ID -> context.CancelFunc for in-flight requests
 	inputValidator               *inputSchemaValidator
@@ -643,10 +646,47 @@ type TaskDecisionFunc func(ctx context.Context, request mcp.CallToolRequest) boo
 // it, a call for which decide returns false runs synchronously and returns
 // its result directly. TaskSupportRequired tools, task-only tools
 // (AddTaskTool), and legacy task-augmented requests (params.task) are not
-// affected.
+// affected. It is WithTaskStart for a decision that only picks the path.
 func WithTaskDecision(decide TaskDecisionFunc) ServerOption {
+	return WithTaskStart(func(ctx context.Context, request mcp.CallToolRequest) TaskStart {
+		return TaskStart{AsTask: decide(ctx, request)}
+	})
+}
+
+// TaskStart is a server's per-request answer to whether, and how, a call to a
+// TaskSupportOptional tool starts as a task (see WithTaskStart).
+type TaskStart struct {
+	// AsTask runs the call as a task. Otherwise it runs synchronously and
+	// returns its result directly.
+	AsTask bool
+	// Context, when non-nil, is the context the tool handler runs with,
+	// whichever way the call runs. It must be derived from the request's
+	// context. It carries what the start function prepared (for example a
+	// job it started) to the handler.
+	Context context.Context
+	// StatusMessage is the task's statusMessage from its creation, in the
+	// create-task result and in tasks/get, until the task ends.
+	StatusMessage string
+	// Meta is the create-task result's _meta, which a client may show the
+	// caller when the task starts.
+	Meta *mcp.Meta
+}
+
+// TaskStartFunc decides how a tools/call request starts (see WithTaskStart).
+type TaskStartFunc func(ctx context.Context, request mcp.CallToolRequest) TaskStart
+
+// WithTaskStart is WithTaskDecision for a server that also prepares the
+// call before the task exists. start runs synchronously, before any task is
+// created, for each call to a TaskSupportOptional tool from a client that
+// declared the tasks extension. Besides choosing the path, it can hand the
+// handler a context and set the task's initial status message and the
+// create-task result's _meta, so work the task does can begin, or be refused
+// with a direct result, before the client is told a task exists.
+// TaskSupportRequired tools, task-only tools (AddTaskTool), and legacy
+// task-augmented requests (params.task) are not affected.
+func WithTaskStart(start TaskStartFunc) ServerOption {
 	return func(s *MCPServer) {
-		s.taskDecision = decide
+		s.taskStart = start
 	}
 }
 
@@ -2334,6 +2374,7 @@ func (s *MCPServer) handleToolCall(
 	// Check if this should be executed as a task (hybrid mode support)
 	// Tools with TaskSupportOptional or TaskSupportRequired can be executed as tasks
 	var shouldExecuteAsTask bool
+	var start *TaskStart
 	if info := RequestProtocolInfoFromContext(ctx); info != nil && info.Modern {
 		shouldExecuteAsTask = clientDeclaredExtension &&
 			tool.Tool.Execution != nil &&
@@ -2341,11 +2382,15 @@ func (s *MCPServer) handleToolCall(
 				tool.Tool.Execution.TaskSupport == mcp.TaskSupportRequired)
 		// Under the extension the server decides per request: a
 		// TaskSupportOptional tool runs synchronously when the server's
-		// task decision declines this call.
-		if shouldExecuteAsTask && s.taskDecision != nil &&
-			tool.Tool.Execution.TaskSupport == mcp.TaskSupportOptional &&
-			!s.taskDecision(ctx, request) {
-			shouldExecuteAsTask = false
+		// task start declines this call.
+		if shouldExecuteAsTask && s.taskStart != nil &&
+			tool.Tool.Execution.TaskSupport == mcp.TaskSupportOptional {
+			decided := s.taskStart(ctx, request)
+			start = &decided
+			shouldExecuteAsTask = decided.AsTask
+			if decided.Context != nil {
+				ctx = decided.Context
+			}
 		}
 	} else {
 		shouldExecuteAsTask = request.Params.Task != nil &&
@@ -2367,7 +2412,7 @@ func (s *MCPServer) handleToolCall(
 
 	if shouldExecuteAsTask {
 		// Route to task-augmented execution handler
-		return s.handleTaskAugmentedToolCall(ctx, id, request)
+		return s.handleTaskAugmentedToolCall(ctx, id, request, start)
 	}
 
 	if taskToolOnly {
@@ -2461,10 +2506,12 @@ func (s *MCPServer) limitToolResult(result *mcp.CallToolResult) *mcp.CallToolRes
 
 // handleTaskAugmentedToolCall handles tool calls that are executed as tasks.
 // It creates a task entry, starts async execution, and returns CreateTaskResult immediately.
+// start, when non-nil, is the server's task start for the call (WithTaskStart).
 func (s *MCPServer) handleTaskAugmentedToolCall(
 	ctx context.Context,
 	id any,
 	request mcp.CallToolRequest,
+	start *TaskStart,
 ) (*mcp.CreateTaskResult, *requestError) {
 	// Look up the tool - check both taskTools and regular tools
 	s.toolsMu.RLock()
@@ -2546,9 +2593,16 @@ func (s *MCPServer) handleTaskAugmentedToolCall(
 	// CreateTaskResult reflects the just-created state even if the async
 	// handler completes before we read it back (a fast/synchronous handler
 	// can finish before this goroutine is scheduled).
-	s.tasksMu.RLock()
+	//
+	// The server's task start (WithTaskStart) sets the working task's status
+	// message here, before its id reaches the client or the handler runs.
+	s.tasksMu.Lock()
+	if start != nil && start.StatusMessage != "" && !entry.completed {
+		entry.task.StatusMessage = start.StatusMessage
+		entry.workingStatusMessage = start.StatusMessage
+	}
 	taskCopy := entry.task
-	s.tasksMu.RUnlock()
+	s.tasksMu.Unlock()
 
 	// Execute tool asynchronously. The goroutine's context is rooted at
 	// s.serverCtx, not the per-request ctx, so it outlives the originating
@@ -2562,6 +2616,9 @@ func (s *MCPServer) handleTaskAugmentedToolCall(
 
 	// Return CreateTaskResult immediately.
 	result := &mcp.CreateTaskResult{Task: taskCopy}
+	if start != nil {
+		result.Meta = start.Meta
+	}
 	if IsModernRequest(ctx) {
 		result.SetResultType(mcp.ResultTypeTask)
 	} else {
@@ -3336,6 +3393,11 @@ func (s *MCPServer) completeTask(entry *taskEntry, result any, err error) {
 	} else {
 		entry.task.Status = mcp.TaskStatusCompleted
 		entry.result = result
+		// The status message it was created with described the working
+		// task, not the finished one.
+		if entry.workingStatusMessage != "" && entry.task.StatusMessage == entry.workingStatusMessage {
+			entry.task.StatusMessage = ""
+		}
 	}
 
 	// Update the lastUpdatedAt timestamp
