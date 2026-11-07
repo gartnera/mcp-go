@@ -670,6 +670,11 @@ type TaskStart struct {
 	// Meta is the create-task result's _meta, which a client may show the
 	// caller when the task starts.
 	Meta *mcp.Meta
+	// Abort, when non-nil, undoes what the start function began when AsTask
+	// is set but the task cannot be created (for example, the concurrent
+	// task limit is reached). The call then fails without running the
+	// handler.
+	Abort func()
 }
 
 // TaskStartFunc decides how a tools/call request starts (see WithTaskStart).
@@ -683,7 +688,9 @@ type TaskStartFunc func(ctx context.Context, request mcp.CallToolRequest) TaskSt
 // create-task result's _meta, so work the task does can begin, or be refused
 // with a direct result, before the client is told a task exists.
 // TaskSupportRequired tools, task-only tools (AddTaskTool), and legacy
-// task-augmented requests (params.task) are not affected.
+// task-augmented requests (params.task) are not affected. Work the start
+// function begins for a task is undone with TaskStart.Abort if the task
+// cannot be created.
 func WithTaskStart(start TaskStartFunc) ServerOption {
 	return func(s *MCPServer) {
 		s.taskStart = start
@@ -2412,7 +2419,15 @@ func (s *MCPServer) handleToolCall(
 
 	if shouldExecuteAsTask {
 		// Route to task-augmented execution handler
-		return s.handleTaskAugmentedToolCall(ctx, id, request, start)
+		result, reqErr := s.handleTaskAugmentedToolCall(ctx, id, request, start)
+		if reqErr != nil {
+			// No task holds what the task start began, so undo it.
+			if start != nil && start.Abort != nil {
+				start.Abort()
+			}
+			return nil, reqErr
+		}
+		return result, nil
 	}
 
 	if taskToolOnly {

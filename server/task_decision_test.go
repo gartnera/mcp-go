@@ -152,3 +152,36 @@ func TestWithTaskStart(t *testing.T) {
 		assert.Equal(t, "prepared", callResult.Content[0].(mcp.TextContent).Text)
 	})
 }
+
+// TestWithTaskStart_AbortWhenTaskNotCreated verifies that what a task start
+// began is undone when the task cannot be created.
+func TestWithTaskStart_AbortWhenTaskNotCreated(t *testing.T) {
+	aborted := 0
+	srv := NewMCPServer("test", "1.0.0",
+		WithTaskCapabilities(true, true, true),
+		WithTasksExtension(),
+		WithMaxConcurrentTasks(1),
+		WithTaskStart(func(ctx context.Context, req mcp.CallToolRequest) TaskStart {
+			return TaskStart{AsTask: true, Abort: func() { aborted++ }}
+		}),
+	)
+	release := make(chan struct{})
+	defer close(release)
+	srv.AddTool(mcp.NewTool("work", mcp.WithTaskSupport(mcp.TaskSupportOptional)),
+		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			<-release
+			return mcp.NewToolResultText("done"), nil
+		})
+
+	resp := callModern(t, srv, "work", nil)
+	_, ok := resp.Result.(*mcp.CreateTaskResult)
+	require.True(t, ok, "Expected *CreateTaskResult, got %T", resp.Result)
+	assert.Equal(t, 0, aborted, "a created task was aborted")
+
+	params, err := json.Marshal(map[string]any{"name": "work", "_meta": modernTaskMeta()})
+	require.NoError(t, err)
+	reply := srv.HandleMessage(t.Context(), []byte(`{"jsonrpc":"2.0","id":2,"method":"tools/call","params":`+string(params)+`}`))
+	_, isErr := reply.(mcp.JSONRPCError)
+	require.True(t, isErr, "Expected a JSON-RPC error past the task limit, got %T: %+v", reply, reply)
+	assert.Equal(t, 1, aborted)
+}
